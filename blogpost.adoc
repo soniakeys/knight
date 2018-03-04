@@ -1,0 +1,381 @@
+= Horse racing and ant colonies
+
+Preface:  For a brief period around the time the Go language was being first
+developed I had a programming blog.  This was posted Nov 9, 2011.
+
+This post might be about a worker synchronization idiom -- whatever an idiom is.
+I don't know.  Is it a way to solve a common problem in a particular language?
+I don't even know if idioms are good or bad.
+
+Anyway, suppose you have a data structure and you want to let multiple workers
+concurrently read from it and, each doing things slightly differently, compute
+independent results.  The workers all need to see the entire data structure,
+but that's okay because the data isn't changing during this read and compute
+phase.  The results need to be combined and reduced.  When all the results are
+in and reduced, the result is used to update the shared data structure.  Then
+it all needs to be repeated for some number of iterations.  Is this common?
+Are there physical simulations or stochastic algorithms that are like this?
+I would think so.
+
+I know, it's not sounding like idiomatic Go.  It's communicating by sharing
+memory.  But still, if it's a common thing and there's a way to do it in the
+language, isn't that an idiom?  (Maybe it's a _bad_ idiom.  Then, I've heard
+people say all idioms are bad.  Maybe it's a good idiom for doing a bad
+thing...)  Sometimes though, you have an existing algorithm and you want to
+follow it, even if it does communicate by sharing memory.
+
+The important feature of the algorithm seemed to be the checkpoints (or
+barriers or whatever) that separate the phases.
+
+Initialization | processing | update | processing | update | ...
+
+* Initialization is a single thread that sets up the shared data.
+
+* Processing involves multiple concurrent workers, and can only start after
+initialization is complete.
+
+* Update is a single thread again and can only start after all workers
+rendezvous.
+
+* The next iteration of processing can only start after the update is complete.
+
+It's not too hard, and surely, like exercise #69 [of the
+https://tour.golang.org/welcome/1[Go Tour]] (it seems to be #70 now) there
+must be lots of ways to do it.  Before showing my complete program though,
+I tried reducing it to a minimal program that would show the just
+synchronization without the clutter of everything else.  It was at that point
+that the problem struck me as analogous to a horse race.
+
+Initialization is like getting the track groomed and everything all set up.
+It has to happen without the horses running around.  There is just one track.
+It is shared.  To keep the horses from starting, there is a gate that holds
+them.  They all wait at the gate until the gate opens and lets them run.
+Then they all begin to run concurrently.  They finish at different times and
+some data is recorded.  At some point, the gates must close in preparation for
+the next race.
+
+[source,go]
+----
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "sync"
+    "time"
+)
+
+var horses = []string{"pie", "biscuit", "lap", "derpy"}
+
+const nRaces =  4
+
+var startSignal, gates sync.WaitGroup
+var finish = make(chan string, len(horses))
+
+func main() {
+    startSignal.Add(1)
+    for _, name := range horses {
+        go horse(name)
+    }
+
+    places := make([]string, len(horses))
+
+    for r := 1; r <= nRaces; r++ {
+        gates.Add(len(horses))
+        startSignal.Done()
+        gates.Wait()
+        startSignal.Add(1)
+
+        for i := range horses {
+            places[i] = <-finish
+        }
+        fmt.Println("race", r, places)
+    }
+}
+
+func horse(horseName string) {
+    rnd := rand.New(rand.NewSource(time.Nanoseconds()))
+    for {
+        // wait for start signal
+        startSignal.Wait()
+        gates.Done()
+
+        // do something
+        time.Sleep(9e7+rnd.Int63n(2e7))
+
+        // return result
+        finish <- horseName
+    }
+}
+----
+
+.Example output:
+....
+race 1 [lap derpy biscuit pie]
+race 2 [derpy pie biscuit lap]
+race 3 [biscuit derpy lap pie]
+race 4 [biscuit derpy pie lap]
+....
+
+It seems a little clunky and mousetrap-like, but I think that might just be
+the nature of communicating by sharing memory. Results are gathered with a
+channel in the usual way, and then I use two WaitGroups to implement the latch
+mechanism of the starting gate. startSignal is binary and is a 1 to N
+broadcast. All of the horses wait on it to fall to zero, implementing the
+starting gates opening. Then there is the problem of setting it back to 1 for
+the start of the next race. It needs to be done before the first horse
+finishes, or else the horse will find the gate open and begin to run again.
+It cannot be done immediately on the next line of code however, because that
+leads to the gate snapping shut before some of the horses have had a chance to
+leave. The solution was a a separate WaitGroup, this one used in the more
+common N to 1 mode indicating when each goroutine has completed the step of
+the horse leaving the gate.
+
+Finally now, the fun program. It's still just a toy problem, but I coded up
+an ant colony solution" of the knight's tour problem as described by Philip
+Hingston and Graham Kendall. It was fun to reproduce their results and get
+the same number for cumulative production rate. (Although I couldn't figure
+out what they were doing to get the .09 number for mean production rate.
+
+[source,go]
+----
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "sync"
+    "time"
+)
+
+const boardSize = 8
+const nSquares = boardSize * boardSize
+const completeTour = nSquares - 1
+const cycles = 27000
+
+// pheromone representation read by ants
+var tNet = make([]float64, nSquares*8)
+
+// row, col deltas of legal moves
+var drc = [][]int{{1, 2}, {2, 1}, {2, -1}, {1, -2},
+    {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}}
+
+// get square reached by following edge k from square (r, c)
+func dest(r, c, k int) (int, int, bool) {
+    r += drc[k][0]
+    c += drc[k][1]
+    return r, c, r >= 0 && r < boardSize && c >= 0 && c < boardSize
+}
+
+// struct represents a pheromone amount associated with a move
+type rckt struct {
+    r, c, k int
+    t       float64
+}
+
+func main() {
+    // waitGroups for ant release clockwork
+    var start, reset sync.WaitGroup
+    start.Add(1)
+    // channel for ants to return tours with pheromone updates
+    tch := make(chan []rckt)
+
+    // create an ant for each square
+    for r := 0; r < boardSize; r++ {
+        for c := 0; c < boardSize; c++ {
+            go ant(r, c, &start, &reset, tch)
+        }
+    }
+
+    // accumulator for new pheromone amounts
+    tNew := make([]float64, nSquares*8)
+
+    // map for collecting set of complete tours
+    allUnique := make(map[string]int)
+    tbuf := make([]byte, 2+completeTour) // for building map key
+
+    // heading
+    fmt.Println("Board size:", boardSize)
+    fmt.Println("Cycles per repeat:", cycles)
+    fmt.Println("          Unique                        Production   Cumm.")
+    fmt.Println("        complete     Cumm.      Total   rate         prod.")
+    fmt.Println("Repeat     tours    unique   attempts   this repeat  rate")
+
+    // each iteration is a "repeat" as described in the paper
+    for repeat := 1; ; repeat++ {
+        unique := make(map[string]int) // complete tours this repeat
+
+        // initialize board
+        for r := 0; r < boardSize; r++ {
+            for c := 0; c < boardSize; c++ {
+                for k := 0; k < 8; k++ {
+                    if _, _, ok := dest(r, c, k); ok {
+                        tNet[(r*boardSize+c)*8+k] = 1e-6
+                    }
+                }
+            }
+        }
+
+        // each iteration is a "cycle" as described in the paper
+        for i := 0; i < cycles; i++ {
+            // evaporate pheromones
+            for i := range tNet {
+                tNet[i] *= .75
+            }
+
+            reset.Add(nSquares) // number of ants to release
+            start.Done()        // release them
+            reset.Wait()        // wait for them to begin searching
+            start.Add(1)        // reset start signal for next cycle
+
+            // gather tours from ants
+            for i := 0; i < nSquares; i++ {
+                tour := <-tch
+                // accumulate complete tours
+                if len(tour) == completeTour {
+                    tbuf[0] = byte(tour[0].r)
+                    tbuf[1] = byte(tour[0].c)
+                    for i, m := range tour {
+                        tbuf[i+2] = byte(m.k)
+                    }
+                    key := string(tbuf)
+                    unique[key] = 1
+                    allUnique[key] = 1
+                }
+                // accumulate pheromone amounts from all ants
+                for _, move := range tour {
+                    tNew[(move.r*boardSize+move.c)*8+move.k] += move.t
+                }
+            }
+
+            // update pheromone amounts on network, reset accumulator
+            for i, tn := range tNew {
+                tNet[i] += tn
+                tNew[i] = 0
+            }
+        }
+
+        // print statistics
+        //  fmt.Println("          Unique                        Production   Cumm.")
+        //  fmt.Println("        complete     Cumm.       Total   rate         prod.")
+        //  fmt.Println("Repeat     tours    unique    attempts   this repeat  rate")
+        fmt.Printf("%6d %9d %9d %10d   %6.4f       %6.4f\n",
+            repeat, len(unique), len(allUnique), repeat*cycles*nSquares,
+            float64(len(unique))/float64(cycles*nSquares),
+            float64(len(allUnique))/float64(repeat*cycles*nSquares))
+    }
+}
+
+func printTour(tour []rckt) {
+    seq := make([]int, nSquares)
+    for i, sq := range tour {
+        seq[sq.r*boardSize+sq.c] = i + 1
+    }
+    last := tour[len(tour)-1]
+    r, c, _ := dest(last.r, last.c, last.k)
+    seq[r*boardSize+c] = nSquares
+    fmt.Println("Move sequence:")
+    for r := 0; r < boardSize; r++ {
+        for c := 0; c < boardSize; c++ {             m := seq[r*boardSize+c]             if m > 0 {
+                fmt.Printf(" %3d", seq[r*boardSize+c])
+            } else {
+                fmt.Print("    ")
+            }
+        }
+        fmt.Println()
+    }
+}
+
+type square struct {
+    r, c int
+}
+
+func ant(r, c int, start, reset *sync.WaitGroup, tourCh chan []rckt) {
+    rnd := rand.New(rand.NewSource(time.Nanoseconds()))
+    tabu := make([]square, nSquares)
+    moves := make([]rckt, nSquares)
+    unexp := make([]rckt, 8)
+    tabu[0].r = r
+    tabu[0].c = c
+
+    for {
+        // cycle initialization
+        moves = moves[:0]
+        tabu = tabu[:1]
+        r := tabu[0].r
+        c := tabu[0].c
+
+        // wait for start signal
+        start.Wait()
+        reset.Done()
+
+        for {
+            // choose next move
+            unexp = unexp[:0]
+            var tSum float64
+        findU:
+            for k := 0; k < 8; k++ {
+                dr, dc, ok := dest(r, c, k)
+                if !ok {
+                    continue
+                }
+                for _, t := range tabu {
+                    if t.r == dr && t.c == dc {
+                        continue findU
+                    }
+                }
+                tk := tNet[(r*boardSize+c)*8+k]
+                tSum += tk
+                // note:  dest r, c stored here
+                unexp = append(unexp, rckt{dr, dc, k, tk})
+            }
+            if len(unexp) == 0 {
+                break // no moves
+            }
+            rn := rnd.Float64() * tSum
+            var move rckt
+            for _, move = range unexp {
+                if rn <= move.t {
+                    break
+                }
+                rn -= move.t
+            }
+
+            // move to new square
+            move.r, r = r, move.r
+            move.c, c = c, move.c
+            tabu = append(tabu, square{r, c})
+            moves = append(moves, move)
+        }
+
+        // compute pheromone amount to leave
+        for i := range moves {
+            moves[i].t = float64(len(moves)-i) / float64(completeTour-i)
+        }
+
+        // return tour found for this cycle
+        tourCh <- moves
+    }
+}
+----
+
+.Output:
+....
+Board size: 8
+Cycles per repeat: 27000
+          Unique                        Production   Cumm.
+        complete     Cumm.      Total   rate         prod.
+Repeat     tours    unique   attempts   this repeat  rate
+     1    176027    176027    1728000   0.1019       0.1019
+     2    172491    348518    3456000   0.0998       0.1008
+     3    201836    550354    5184000   0.1168       0.1062
+     4    104574    654928    6912000   0.0605       0.0948
+     5    117130    772058    8640000   0.0678       0.0894
+...
+    95    193387  12424890  164160000   0.1119       0.0757
+    96     37647  12462537  165888000   0.0218       0.0751
+    97    121887  12584424  167616000   0.0705       0.0751
+    98    145072  12729496  169344000   0.0840       0.0752
+    99    162658  12892154  171072000   0.0941       0.0754
+   100    206599  13098753  172800000   0.1196       0.0758
+....
