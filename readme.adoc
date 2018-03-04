@@ -1,0 +1,12 @@
+= Knight
+
+Knight's tour solution by ant colony optimization, following "Enumerating
+Knight's Tours using an Ant Colony Algorithm" by Philip Hingston and Graham
+Kendal.
+
+Originally coded for Rosetta Code, but also previously posted on a blog which
+is now offline.  I copied the post to this repo though, as blogpost.adoc.
+
+The code is not generalized to solve other optimization problems, but kind of
+hard coded for the Knight's tour.  Still, it's fun to see it not just solve
+the Knight's tour, but find thousands of unique tours per second.
